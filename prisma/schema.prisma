@@ -1,0 +1,160 @@
+// Trading Journal — MT5 integration schema
+// Two connection methods share this schema: DIRECT_API and BRIDGE (EA).
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum ConnectionMethod {
+  DIRECT_API
+  BRIDGE
+}
+
+enum ConnectionStatus {
+  CONNECTED
+  OFFLINE
+  ERROR
+  PENDING
+}
+
+enum AccountType {
+  DEMO
+  LIVE
+}
+
+enum SetupGrade {
+  A_PLUS
+  A
+  B
+  C
+  UNKNOWN
+}
+
+enum Session {
+  LONDON
+  NEW_YORK
+  OUTSIDE_SESSION
+}
+
+enum RiskStatus {
+  PASS
+  VIOLATION
+  UNRECONSTRUCTABLE
+}
+
+model User {
+  id        String    @id @default(cuid())
+  email     String    @unique
+  createdAt DateTime  @default(now())
+  accounts  MT5Account[]
+}
+
+// One row per connected MT5 account (broker account number + server).
+model MT5Account {
+  id                String            @id @default(cuid())
+  userId            String
+  user              User              @relation(fields: [userId], references: [id])
+  label             String            // e.g. "25K Evaluation"
+  broker            String
+  server            String
+  accountNumber     String
+  accountType       AccountType
+  connectionMethod  ConnectionMethod
+  status            ConnectionStatus  @default(PENDING)
+
+  // Bridge-only fields
+  bridgeTokenHash   String?           // hashed connection token, never store raw
+  bridgeVersion     String?
+
+  // Direct-API-only fields (never store raw secrets — use env-backed vault ref)
+  apiCredentialRef  String?
+
+  balance           Float?
+  equity            Float?
+  freeMargin        Float?
+  margin            Float?
+  currency          String?
+
+  lastSyncAt        DateTime?
+  nextSyncAt        DateTime?
+
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  trades            Trade[]
+  syncErrors        SyncError[]
+
+  @@unique([broker, server, accountNumber]) // prevents duplicate account connections
+}
+
+enum TradeStatus {
+  OPEN
+  CLOSED
+}
+
+// One row per MT5 position — created when the position opens, updated in
+// place when it closes. Keyed on positionId (the MT5 position ticket),
+// NOT on deal ticket: a position has one opening deal and one closing deal
+// with two different ticket numbers, so keying on deal ticket would create
+// a second row the moment a trade closes. positionId is stable across the
+// whole life of the trade, which is what idempotent open->close updates need.
+model Trade {
+  id              String       @id @default(cuid())
+  accountId       String
+  account         MT5Account   @relation(fields: [accountId], references: [id])
+
+  // External identity — used for idempotent sync (duplicate protection)
+  positionId      String
+  broker          String
+  server          String
+  brokerAccount   String
+
+  // Deal tickets kept for audit only — never used as the identity key
+  openDealId      String?
+  closeDealId     String?
+
+  status          TradeStatus  @default(OPEN)
+  symbol          String
+  side            String       // BUY / SELL
+  volume          Float
+  entryPrice      Float
+  exitPrice       Float?
+  stopLoss        Float?
+  takeProfit      Float?
+  profit          Float?       // floating P&L while OPEN, realized once CLOSED
+  commission      Float?
+  swap            Float?
+
+  entryAt         DateTime
+  exitAt          DateTime?
+  durationMinutes Int?
+
+  // Derived analysis — computed at ingestion time, never invented
+  session         Session?
+  setupGrade      SetupGrade   @default(UNKNOWN)
+  riskStatus      RiskStatus?
+  requiredRiskPct Float?
+  actualRiskPct   Float?
+  rMultiple       Float?
+
+  source          ConnectionMethod
+  importedAt      DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  @@unique([broker, server, brokerAccount, positionId]) // idempotency key
+}
+
+model SyncError {
+  id            String      @id @default(cuid())
+  accountId     String
+  account       MT5Account  @relation(fields: [accountId], references: [id])
+  occurredAt    DateTime    @default(now())
+  errorType     String
+  message       String
+  lastGoodSync  DateTime?
+}
